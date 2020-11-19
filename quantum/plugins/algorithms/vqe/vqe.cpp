@@ -378,6 +378,9 @@ VQE::execute(const std::shared_ptr<AcceleratorBuffer> buffer,
   else {
     for (int i = 0; i < fsToExec.size(); i++) { // compute energy
       auto expval = buffers[i]->getExpectationValueZ();
+      std::cout << "name = " << buffers[i]->name() << "\n";
+      std::cout << "coeff = " << coefficients[i] << "\n";
+      std::cout << "Z = " << expval << "\n";
       energy += expval * coefficients[i];
       if (!buffers[i]->getMeasurementCounts().empty()) {
         auto paulvar = 1. - expval * expval;
