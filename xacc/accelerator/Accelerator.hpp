@@ -51,6 +51,12 @@ public:
   virtual void updateConfiguration(const HeterogeneousMap &&config) {
     updateConfiguration(config);
   }
+
+  // Set the Accelerator communicator context if using QPU virtualization.
+  virtual void setVirtualComm(void *comm){};
+  // Set memory (simulator only)
+  virtual void setMemoryLimit(uint64_t bytes){};
+
   virtual const std::vector<std::string> configurationKeys() = 0;
 
   virtual HeterogeneousMap getProperties() { return HeterogeneousMap(); }

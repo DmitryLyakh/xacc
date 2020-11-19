@@ -90,6 +90,7 @@ void HPCVirtDecorator::execute(
     }
     decoratedAccelerator->updateConfiguration(
         {{"mpi-communicator", qpu_comm_ptr}});
+    decoratedAccelerator->setVirtualComm(qpu_comm_ptr);
     // just execute
     decoratedAccelerator->execute(buffer, functions);
     return;
@@ -112,6 +113,7 @@ void HPCVirtDecorator::execute(
   void *qpu_comm_ptr = reinterpret_cast<void *>((MPI_Comm)qpu_comm);
   decoratedAccelerator->updateConfiguration(
       {{"mpi-communicator", qpu_comm_ptr}});
+  decoratedAccelerator->setVirtualComm(qpu_comm_ptr);
 
   // Everybody split the CompositeInstructions vector into n_virtual_qpu
   // segments
