@@ -244,6 +244,7 @@ Transition dipole moment: 1.5656,2.8158,-0.0976
     accelerator = xacc::getAccelerator(
         "tnqvm", {{"tnqvm-visitor", "exatn"},
                   {"exatn-buffer-size-gb", exatnBufferSize}});
+    accelerator->setMemoryLimit(exatnBufferSize * (1ULL << 30));
   } else if (acc == "qpp") {
     accelerator = xacc::getAccelerator("qpp");
   } else if (acc == "aer") {
