@@ -9,6 +9,7 @@
  *
  * Contributors:
  *   Alexander J. McCaskey - initial API and implementation
+ *   Dmitry I. Lyakh - logic optimization
  *******************************************************************************/
 #include "hpc_virt_decorator.hpp"
 #include "InstructionIterator.hpp"
@@ -93,7 +94,7 @@ void HPCVirtDecorator::execute(
     // The number of MPI processes is less than the number of requested virtual
     // QPUs, just execute as if there is only one virtual QPU and give the QPU
     // the whole MPI_COMM_WORLD.
-    xacc::warning("MPI rank < Number of virtual QPUs. Will perform serial execution " + std::to_string(world_size) + "x times.");
+    xacc::warning("MPI size < Number of virtual QPUs. Will perform serial execution " + std::to_string(world_size) + "x times.");
     void *qpu_comm_ptr = reinterpret_cast<void *>((MPI_Comm)world);
     if (!qpuComm) {
       qpuComm = std::make_shared<boost::mpi::communicator>(world);
@@ -104,12 +105,21 @@ void HPCVirtDecorator::execute(
     // just execute
     decoratedAccelerator->execute(buffer, functions);
     return;
-  } else {
-    xacc::info("Number of MPI ranks allow parallel execution.");
   }
 
+  xacc::info("MPI size allows parallel QPU execution.");
+
   // Get the color for this rank
-  int color = world_rank % n_virtual_qpus;
+  //int color = world_rank % n_virtual_qpus;
+  int bin_size = world_size / n_virtual_qpus;
+  int bin_remainder = world_size % n_virtual_qpus;
+  int color = 0;
+  if(world_rank < ((bin_size + 1) * bin_remainder)){
+   color = world_rank / (bin_size + 1); //color = [0..bin_remainder-1]
+  }else{
+   color = bin_remainder +              //color = [bin_remainder..n_virtual_qpus-1]
+           (world_rank - ((bin_size + 1) * bin_remainder)) / bin_size;
+  }
 
   // Split the communicator based on the color and use the
   // original rank for ordering
