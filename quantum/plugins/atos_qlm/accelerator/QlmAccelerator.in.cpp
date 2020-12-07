@@ -15,8 +15,13 @@
 #include <cassert>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <pybind11/functional.h>
 #include <dlfcn.h>
 #include "xacc_config.hpp"
+#include "xacc_service.hpp"
+#include "NoiseModel.hpp"
+#include <random>
+
 using namespace pybind11::literals;
 
 namespace {
@@ -313,14 +318,200 @@ void QlmAccelerator::initialize(const HeterogeneousMap &params) {
     }
   }
 
-  // TODO: choose linalg, feymann, mps simulators
-  auto qpuMod = pybind11::module::import("qat.linalg.qpu");
-  m_qlmQpuServer = qpuMod.attr("get_qpu_server")();
+  // Handle IBM backend noisy simulation:
+  // IMPORTANT NOTES: I don't see the API for specifying gate noise *per-qubit*
+  // yet, hence, we just use the noise value of qubit 0. i.e. Hadamard on q[0],
+  // q[1], etc. are treated the same (using the noise value of q[0]).
+  m_noiseModel.reset();
+  if (params.stringExists("backend")) {
+    m_noiseModel = xacc::getService<NoiseModel>("IBM");
+    m_noiseModel->initialize(params);
+    auto qlmHardwareMod = pybind11::module::import("qat.hardware.default");
+    auto hardwareModel = qlmHardwareMod.attr("HardwareModel");
+    auto gatesSpecification = qlmHardwareMod.attr("DefaultGatesSpecification");
+    // List of gate to initialize the QLM noise model:
+    // Note: other gates (dagger and control) are expresses in terms of these
+    // gates.
+    const std::vector<std::string> GATE_SET{"X",  "Y", "Z", "Rx", "Ry",
+                                            "Rz", "H", "S", "T",  "U"};
+    const std::unordered_map<std::string, double> QLM_GATE_ERRORS = [&]() {
+      auto gateRegistry = xacc::getService<xacc::IRProvider>("quantum");
+      std::unordered_map<std::string, double> result;
+      for (const auto &gateName : GATE_SET) {
+        auto gate = gateRegistry->createInstruction(gateName, 0);
+        auto aqasmGateName = gateName;
+        std::for_each(aqasmGateName.begin(), aqasmGateName.end(),
+                      [](char &c) { c = ::toupper(c); });
+        if (aqasmGateName == "U") {
+          aqasmGateName = "CustomGate";
+        }
+        result[aqasmGateName] = m_noiseModel->gateErrorProb(
+            *std::dynamic_pointer_cast<xacc::quantum::Gate>(gate));
+      }
+      // Add 2-qubit noise:
+      CNOT cx_gate(0, 1);
+      result["CNOT"] = m_noiseModel->gateErrorProb(cx_gate);
+      return result;
+    }();
+
+    pybind11::dict gates_noise;
+    for (const auto &[aqasmGate, errorRate] : QLM_GATE_ERRORS) {
+      // std::cout << aqasmGate << ": " << errorRate << "\n";
+      if (aqasmGate == "RX" || aqasmGate == "RY" || aqasmGate == "RZ") {
+        gates_noise[aqasmGate.c_str()] = pybind11::cpp_function(
+            [errorRate, aqasmGate](double theta, pybind11::kwargs kwarg) {
+              auto make_depolarizing_channel =
+                  pybind11::module::import("qat.quops.quantum_channels")
+                      .attr("make_depolarizing_channel");
+              return make_depolarizing_channel(errorRate, 1);
+            });
+      } else {
+        gates_noise[aqasmGate.c_str()] = pybind11::cpp_function(
+            [errorRate, aqasmGate](pybind11::kwargs kwarg) {
+              auto make_depolarizing_channel =
+                  pybind11::module::import("qat.quops.quantum_channels")
+                      .attr("make_depolarizing_channel");
+              const int arity = (aqasmGate == "CNOT") ? 2 : 1;
+              return make_depolarizing_channel(errorRate, arity);
+            });
+      }
+    }
+
+    auto gates_spec = gatesSpecification();
+    auto hw_model = hardwareModel(gates_spec, gates_noise);
+    // Noisy simulator:
+    auto noisyQProc = pybind11::module::import("qat.qpus").attr("NoisyQProc");
+    m_qlmQpuServer = noisyQProc(hw_model);
+    // For noisy sim, we must run QLM in shots mode:
+    constexpr int DEFAULT_NUM_SHOTS = 1024;
+    if (m_shots < 0) {
+      m_shots = DEFAULT_NUM_SHOTS;
+    }
+  } else {
+    // No noise:
+    // There are 4 types of simulator:
+    // (1) LinAlg
+    // (2) MPS
+    // (3) Feynman
+    // (4) BDD (Quantum Multi-valued Decision Diagrams)
+    // Default is LinAlg, which is the most versatile (consistent perf. in most cases)
+    // User can switch between them using the "sim-type" option:
+    using SimFactory =
+        std::function<pybind11::object(const HeterogeneousMap &)>;
+    const SimFactory createMpsSim = [](const HeterogeneousMap &configs) {
+      auto simClass = pybind11::module::import("qat.qpus").attr("MPS");
+      // Default MPS settings:
+      // lnnize=True, no_merge=False, threshold=None, n_trunc=None
+      // Supported users-options (that we exposed to XACC):
+      // mps-threshold: specify threshold below which Schmidt coefficients are
+      // truncated. 
+      // max-bond: specify maximum number of non-zero Schmidt
+      // coefficients.
+      std::optional<double> threshold;
+      if (configs.keyExists<double>("mps-threshold")) {
+        threshold = configs.get<double>("mps-threshold");
+      }
+
+      std::optional<double> n_trunc;
+      if (configs.keyExists<int>("max-bond")) {
+        n_trunc = configs.get<int>("max-bond");
+      }
+
+      auto kwargs = pybind11::dict("lnnize"_a=true, "no_merge"_a=false, "threshold"_a=threshold, "n_trunc"_a=n_trunc);
+      return simClass(kwargs);
+    };
+
+    const SimFactory createFeynmanSim = [](const HeterogeneousMap &configs) {
+      // Support changing number of threads:
+      int nbThreads = 1;
+      if (configs.keyExists<int>("threads")) {
+        nbThreads = configs.get<int>("threads");
+      }
+      auto simClass = pybind11::module::import("qat.qpus").attr("Feynman");
+      return simClass(nbThreads);
+    };
+
+    const SimFactory createBddSim = [](const HeterogeneousMap &configs) {
+      // Support changing number of threads:
+      int nbThreads = 1;
+      if (configs.keyExists<int>("threads")) {
+        nbThreads = configs.get<int>("threads");
+      }
+      auto simClass = pybind11::module::import("qat.qpus").attr("Bdd");
+      return simClass(nbThreads);
+    };
+
+    static const std::unordered_map<std::string, SimFactory> SIM_REGISTRY{
+        // LinAlg doesn't have any extra runtime params
+        {"LinAlg",
+         [](const HeterogeneousMap &configs) {
+           return pybind11::module::import("qat.qpus").attr("LinAlg")();
+         }},
+        {"MPS", createMpsSim},
+        {"Feynman", createFeynmanSim},
+        {"Bdd", createBddSim},
+    };
+
+    // Default:
+    std::string simType = "LinAlg";
+    if (params.stringExists("sim-type")) {
+      simType = params.getString("sim-type");
+    }
+
+    const auto iter = SIM_REGISTRY.find(simType);
+    if (iter == SIM_REGISTRY.end()) {
+      xacc::error("The requested sim-type of '" + simType + "' is invalid.");
+    }
+
+    m_qlmQpuServer = (iter->second)(params);
+
+    // Important notes: Feynman and BDD don't support Observable mode,
+    // hence, must use shots.
+    if (simType == "Feynman" || simType == "Bdd") {
+      // No shots was specified.
+      constexpr int DEFAULT_NUM_SHOTS = 1024;
+      if (m_shots < 0) {
+        m_shots = DEFAULT_NUM_SHOTS;
+      }
+    }
+  }
+}
+
+std::vector<std::pair<int, int>> QlmAccelerator::getConnectivity() {
+  if (m_noiseModel) {
+    // There is a hardware model, i.e. IBM backend.
+    // Note: the noise model has noise data for both directions of the pair,
+    // hence, we use set to return non-directional coupling map.
+    std::set<std::pair<int, int>> couplingMap;
+    auto twoQubitPairs = m_noiseModel->averageTwoQubitGateFidelity();
+    for (const auto &[q1, q2, err] : twoQubitPairs) {
+      if (q1 < q2) {
+        couplingMap.emplace(q1, q2);
+      } else {
+        couplingMap.emplace(q2, q1);
+      }
+    }
+    std::vector<std::pair<int, int>> result(couplingMap.begin(),
+                                            couplingMap.end());
+    return result;
+  }
+  return {};
 }
 
 pybind11::object QlmAccelerator::constructQlmJob(
     std::shared_ptr<AcceleratorBuffer> buffer,
     std::shared_ptr<CompositeInstruction> compositeInstruction) const {
+  if (m_noiseModel) {
+    // If having a noise model, use Staq to translate the Composite 
+    // to OpenQASM so that two-qubit gates are translated to CX -> can map to noise data.
+    auto compiler = xacc::getCompiler("staq");
+    auto circuit_src = compiler->translate(compositeInstruction);
+    auto recompile = compiler->compile(circuit_src)->getComposites()[0];
+    // std::cout << "HOWDY: \n" << recompile->toString() << "\n";
+    compositeInstruction->clear();
+    compositeInstruction->addInstructions(recompile->getInstructions());
+  }
+
   QlmCircuitVisitor visitor(buffer->size());
   // Walk the IR tree, and visit each node
   InstructionIterator it(compositeInstruction);
@@ -342,6 +533,11 @@ pybind11::object QlmAccelerator::constructQlmJob(
   if (m_shots > 0 || measureBitIdxs.empty()) {
     job.attr("nbshots") = m_shots;
     job.attr("type") = getJobType(JobType::Sample);
+    // If there is no measure gate, default is to measure all.
+    // Otherwise, specify the qubits to be measured.
+    if (!measureBitIdxs.empty()) {
+      job.attr("qubits") = measureBitIdxs;
+    }
   } else {
     // Exp-val calc.
     job.attr("observable") = exp_val_z_obs(buffer->size(), measureBitIdxs);
@@ -351,7 +547,46 @@ pybind11::object QlmAccelerator::constructQlmJob(
 }
 
 void QlmAccelerator::persistResultToBuffer(
-    std::shared_ptr<AcceleratorBuffer> buffer, pybind11::object &result) const {
+    std::shared_ptr<AcceleratorBuffer> buffer, pybind11::object &result,
+    pybind11::object &job) const {
+  static auto randomProbFunc =
+      std::bind(std::uniform_real_distribution<double>(0, 1),
+                std::mt19937(std::chrono::high_resolution_clock::now()
+                                 .time_since_epoch()
+                                 .count()));
+  // Apply readout error sampling on the result:
+  // Note: we handle this separately here since it seems like the QLM API
+  // doesn't have a way to specify per-qubit error rate.
+  const auto applyReadoutError = [&](const std::string &bitString, int count,
+                                     const NoiseModel &in_noiseModel) {
+    std::vector<int> measureQubits;
+    try {
+      measureQubits = job.attr("qubits").cast<std::vector<int>>();
+    } catch (...) {
+      measureQubits.clear();
+      for (int i = 0; i < bitString.size(); ++i) {
+        measureQubits.emplace_back(i);
+      }
+    }
+    assert(measureQubits.size() == bitString.size());
+
+    for (int i = 0; i < count; ++i) {
+      std::string newBitString;
+      for (int j = 0; j < measureQubits.size(); ++j) {
+        auto qubitIdx = measureQubits[j];
+        const bool bit = (bitString[j] == '1');
+        const auto roErrorProb = randomProbFunc();
+        const auto [meas0Prep1, meas1Prep0] =
+            in_noiseModel.readoutError(qubitIdx);
+        const double flipProb = bit ? meas0Prep1 : meas1Prep0;
+        const bool measBit = (roErrorProb < flipProb) ? !bit : bit;
+        newBitString.push_back(measBit ? '1' : '0');
+      }
+      assert(newBitString.size() == bitString.size());
+      buffer->appendMeasurement(newBitString);
+    }
+  };
+
   if (result.attr("value").is_none()) {
     auto iter = pybind11::iter(result);
     while (iter != pybind11::iterator::sentinel()) {
@@ -360,7 +595,11 @@ void QlmAccelerator::persistResultToBuffer(
       bitStr = bitStr.substr(1, bitStr.size() - 2);
       auto bitStrProb = sampleData.attr("probability").cast<double>();
       int count = std::round(bitStrProb * m_shots);
-      buffer->appendMeasurement(bitStr, count);
+      if (m_noiseModel) {
+        applyReadoutError(bitStr, count, *m_noiseModel);
+      } else {
+        buffer->appendMeasurement(bitStr, count);
+      }
       ++iter;
     }
   } else {
@@ -374,7 +613,7 @@ void QlmAccelerator::execute(
     const std::shared_ptr<CompositeInstruction> compositeInstruction) {
   auto qlmJob = constructQlmJob(buffer, compositeInstruction);
   auto result = m_qlmQpuServer.attr("submit")(qlmJob);
-  persistResultToBuffer(buffer, result);
+  persistResultToBuffer(buffer, result, qlmJob);
 }
 
 void QlmAccelerator::execute(
@@ -396,8 +635,9 @@ void QlmAccelerator::execute(
   int childBufferIndex = 0;
   while (iter != pybind11::iterator::sentinel()) {
     auto result = (*iter).cast<pybind11::object>();
-    persistResultToBuffer(childBuffers[childBufferIndex++], result);
+    persistResultToBuffer(childBuffers[childBufferIndex], result, batch[childBufferIndex]);
     ++iter;
+    ++childBufferIndex;
   }
   assert(childBufferIndex == childBuffers.size());
   for (auto &childBuffer : childBuffers) {
