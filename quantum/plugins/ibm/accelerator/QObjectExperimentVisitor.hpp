@@ -32,6 +32,7 @@ protected:
   int nTotalQubits = 0;
   std::vector<int> usedMemorySlots;
   std::optional<int64_t> conditionalRegId;
+  std::map<std::pair<std::string, std::size_t>, std::size_t> cReg_to_meas_idx;
 
 public:
   int maxMemorySlots = 0;
@@ -47,9 +48,14 @@ public:
   // XACC Composite is decomposed into this gate set when generating the QObject.
   enum class GateSet { U_CX, RZ_SX_CX };
   GateSet gateSet;
+  // Do we want to include Identity gate in the generated QObj?
+  // By default, we skip all Id gates.
+  bool skipIdGate;
   QObjectExperimentVisitor(const std::string expName, const int nQubits,
-                           GateSet nativeGateSet = GateSet::U_CX)
-      : experimentName(expName), nTotalQubits(nQubits), gateSet(nativeGateSet) {
+                           GateSet nativeGateSet = GateSet::U_CX,
+                           bool ignoreIdGate = true)
+      : experimentName(expName), nTotalQubits(nQubits), gateSet(nativeGateSet),
+        skipIdGate(ignoreIdGate) {
     int counter = 0;
     for (int b = 0; b < nQubits; b++) {
       qubit2MemorySlot.insert({b, counter});
@@ -220,10 +226,14 @@ public:
   }
 
   void visit(Identity &i) override {
-    // std::stringstream js;
-    // native += "id q[" + std::to_string(i.bits()[0]) + "];\n";
-    // js << "{\"name\":\"id\",\"params\": [],\"qubits\":[" <<
-    // i.bits()[0]<<"]},"; operationsJsonStr += js.str();
+    // Only add "id" instruction if requested.
+    if (!skipIdGate) {
+      xacc::ibm::Instruction inst;
+      inst.get_mutable_qubits().push_back(i.bits()[0]);
+      inst.get_mutable_name() = "id";
+      setConditional(inst);
+      instructions.push_back(inst);
+    }
   }
 
   void visit(CRZ &crz) override {
@@ -346,16 +356,28 @@ public:
           "IBM: Invalid classical bit index for measurement, already used.");
     }
 
-    auto classicalBit = m.getParameter(0).as<int>();
     xacc::ibm::Instruction inst;
     inst.get_mutable_qubits().push_back(m.bits()[0]);
     inst.get_mutable_name() = "measure";
     inst.set_memory({maxMemorySlots});
     instructions.push_back(inst);
-
+    if (m.hasClassicalRegAssignment()) {
+      auto classicalBit = m.getParameter(0).as<int>();
+      auto classicalReg = m.getBufferNames()[1];
+      cReg_to_meas_idx[std::make_pair(classicalReg, classicalBit)] =
+          inst.get_memory()[0];
+    }
     // if (classicalBit > maxMemorySlots) {
     maxMemorySlots++; // = qubit2MemorySlot[m.bits()[0]];
     // }
+  }
+
+  void visit(Reset &reset) override {
+    xacc::ibm::Instruction inst;
+    inst.get_mutable_qubits().push_back(reset.bits()[0]);
+    inst.get_mutable_name() = "reset";
+    setConditional(inst);
+    instructions.push_back(inst);
   }
 
   void visit(Rx &rx) override {
@@ -403,7 +425,16 @@ public:
 
   void visit(IfStmt &ifStmt) override {
     const auto cregId = ifStmt.bits()[0];
-    auto bfuncInst = xacc::ibm::Instruction::createConditionalInst(cregId);
+    const auto cregName = ifStmt.getParameters()[0].as<std::string>();
+    const auto absRegId = [&]() {
+      auto iter = cReg_to_meas_idx.find(std::make_pair(cregName, cregId));
+      if (iter != cReg_to_meas_idx.end()) {
+        return iter->second;
+      } else {
+        return cregId;
+      }
+    }();
+    auto bfuncInst = xacc::ibm::Instruction::createConditionalInst(absRegId);
     const auto regId = bfuncInst.get_bFunc()->registerId;
     instructions.push_back(bfuncInst);
     // All the instructions that are scoped inside this block must have a
