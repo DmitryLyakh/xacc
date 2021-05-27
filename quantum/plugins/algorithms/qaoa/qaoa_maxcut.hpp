@@ -45,7 +45,8 @@ private:
     std::string m_initializationMode = "default";
     xacc::Graph* m_graph;
     bool m_maximize = false;
-    CompositeInstruction* m_initial_state;
+    CompositeInstruction* m_initial_state = nullptr;
+    bool m_shuffleTerms = false;
 };
 } // namespace algorithm
 } // namespace xacc

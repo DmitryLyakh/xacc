@@ -27,7 +27,7 @@ if (FROM_SETUP_PY AND NOT APPLE)
 endif()
 
 find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git" AND NOT EXISTS "${CMAKE_SOURCE_DIR}/tpls/boost-cmake/CMakeLists.txt")
     # Update submodules as needed
     option(GIT_SUBMODULE "Check submodules during build" ON)
     if(GIT_SUBMODULE)
@@ -72,6 +72,7 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
 include(format)
+include(cxxFlags)
 include(ExternalProject)
 
 if(NOT WIN32)
